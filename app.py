@@ -1,51 +1,131 @@
-import os
-import json
-import pytz
-import torch
-import pickle
-import re
-import ast
-from datetime import datetime
-from typing import TypedDict, Optional, List
+import gradio as gr
 from dotenv import load_dotenv
+import pytz
+from datetime import datetime
+import logging
+import os
+import pickle
+import torch
 
+from langchain.memory import ConversationSummaryBufferMemory
+from langchain.schema.runnable import RunnablePassthrough
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.memory import ConversationBufferMemory
 
+from langchain_core.pydantic_v1 import BaseModel, Field
+from langchain_core.output_parsers import StrOutputParser, JsonOutputParser
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+
+from langchain_community.document_transformers import LongContextReorder
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.document_loaders import CSVLoader
 from langchain_community.vectorstores import FAISS
 from langchain_community.vectorstores.utils import DistanceStrategy
 
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_openai import ChatOpenAI
-from langgraph.graph import StateGraph, END
-from langchain_core.runnables import RunnableLambda
-from langchain_core.messages import HumanMessage
-from langchain.prompts import ChatPromptTemplate
-
-# ==== Environment Setup ====
 load_dotenv()
+API_KEY = os.environ.get("OPENAI_API_KEY")
+
 timezone = pytz.timezone('Asia/Seoul')
 date = datetime.now(timezone).strftime("%Y-%m-%d_%H-%M-%S")
+
 os.makedirs("database/log", exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(f"database/log/debug-{date}.log",  encoding="utf-8")
+    ]
+)
+
+TRIGGER_SYSTEM = """You are a model that matches values to the keys in a dictionary by summarizing the information from the user's query.  
+Exclude information for keys that have already been collected. If information cannot be found, the value should be returned as an empty string ("").  
+**Never fabricate information that the user has not provided.**  
+
+If the user's input is in a language other than English, translate the information into English before adding it to the dictionary.  
+
+Additionally, increment the num_fill field based on the number of keys updated through the user's query.  
+
+If no changes are made to the dictionary, return the dictionary as it was received.
+"""
+
+SYSTEM_MESSAGE = """You are an assistant designed to help with drafting RFPs (Request for Proposals). Follow the structure of the provided example RFP to create new RFPs, ensuring consistency and clarity. 
+
+### Key Instructions:
+1. **RFP Structure Adherence**: 
+   - Use the example RFP format as a strict template.
+   - Maintain professionalism and logical flow in the document.
+
+2. **Handling Missing Information**:
+   - Avoid directly mentioning any missing details.
+   - Steer the dialogue naturally to gather required information without explicitly stating gaps. For example:
+     - "Could you share more about the project timeline?"
+     - "What are the specific deliverables you'd like to highlight?"
+
+3. **Casual Conversation Handling**:
+   - If the user shifts to casual conversation, accommodate smoothly. 
+   - Maintain readiness to pivot back to the task upon user indication.
+
+4. **Chain of Thought (CoT) Approach**:
+   - Break down the task systematically:
+     - Analyze the provided example RFP for its structure and key components.
+     - Identify the necessary inputs for each section.
+     - Draft the new RFP step-by-step, filling in the sections with the provided information.
+     - Ensure consistency and professionalism throughout.
+   - This approach ensures clarity and minimizes errors.
+
+5. **User Collaboration**:
+   - Engage the user to clarify or expand on ambiguous points through natural dialogue.
+   - Present options when uncertainties arise, allowing the user to make informed choices.
+
+### Additional Information to Gather:
+- **Funding Ask**: Details about the funding request.
+- **Milestones**: Key milestones for the project.
+- **Who We Are**: Introduction to the team or organization.
+- **Our Story**: Background and motivation for the project.
+- **Our Solution & Milestone**: Solution details and associated project milestones.
+- **Impact**: Expected impact of the project.
+- **Member Details**: Information about team members.
+- **Media**: Relevant media links or content.
+"""
+
+reordering = LongContextReorder()
 
 llm = ChatOpenAI(
     model="gpt-4o-mini",
-    max_tokens=1024,
-    temperature=0.7,
+    max_tokens=4096,
+    temperature=1.2,
 )
 
-memory = ConversationBufferMemory(return_messages=True)
+memory = ConversationSummaryBufferMemory(
+    llm=llm,
+    max_token_limit=512,
+    memory_key="history",
+    return_messages=True
+)
 
-# ==== CSV Ingestor ====
+
+def format_docs(docs):
+    if len(docs) >= 10:
+        docs = reordering.transform_documents(docs)
+
+    return "\n\n".join(doc.page_content for doc in docs)
+
+
+def load_memory(text):
+    return memory.load_memory_variables({})['history']
+
+
 class CSVIngestor:
     def __init__(
-        self,
-        model_name: str = 'BAAI/bge-m3',
-        data_path: str = 'database/RFP',
-        text_save_path: str = 'database',
-        vector_store_path: str = 'database/faiss.index',
-    ):
+            self,
+            model_name: str = 'NovaSearch/stella_en_400M_v5',
+            data_path: str = 'database/RFP',
+            text_save_path: str = 'database',
+            vector_store_path: str = 'database/faiss.index',
+        ):
+
         self.vector_store_path = vector_store_path
         self.data_path = data_path
         self.text_save_path = text_save_path
@@ -54,12 +134,14 @@ class CSVIngestor:
 
         if not os.path.isfile(self.text_save_path + '/rfp_data.pkl'):
             self.docs_list = self.get_docs()
+
             self.text_splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
                 model_name="gpt-4",
-                chunk_size=1024,
-                chunk_overlap=64
+                chunk_size=2048,
+                chunk_overlap=100
             )
             doc_splits = self.text_splitter.split_documents(self.docs_list)
+
             with open(f'{self.text_save_path}/rfp_data.pkl', 'wb') as f:
                 pickle.dump(doc_splits, f)
         else:
@@ -68,12 +150,18 @@ class CSVIngestor:
 
         self.embeddings = HuggingFaceEmbeddings(
             model_name=model_name,
-            model_kwargs={"device": device},
-            encode_kwargs={"normalize_embeddings": True},
+            model_kwargs={
+                "device": device,
+                "trust_remote_code": True
+            },
+            encode_kwargs={
+                "normalize_embeddings": True,
+                "prompt_name": "s2p_query"
+            },
             cache_folder=f'{text_save_path}/model'
         )
 
-        if os.path.exists(self.vector_store_path):
+        if os.path.exists(self.vector_store_path) and self.vector_store_path is not None:
             self.vector_store = FAISS.load_local(
                 self.vector_store_path,
                 self.embeddings,
@@ -85,177 +173,140 @@ class CSVIngestor:
                 embedding=self.embeddings,
                 distance_strategy=DistanceStrategy.MAX_INNER_PRODUCT
             )
+
             self.vector_store.save_local(self.vector_store_path)
 
     def get_docs(self):
         if os.path.isdir(self.data_path):
-            csv_files = [file_name for file_name in os.listdir(self.data_path) if file_name.endswith(".csv")]
-            if csv_files:
+            if any(file_name.endswith(".csv") for file_name in os.listdir(self.data_path)):
                 loader = CSVLoader(
-                    file_path=os.path.join(self.data_path, csv_files[0]),
+                    file_path=os.path.join(self.data_path, [file_name for file_name in os.listdir(self.data_path) if file_name.endswith(".csv")][0]),
                     csv_args={'delimiter': ','},
                     encoding='utf-8'
                 )
-                return loader.load()
-        raise ValueError("No valid data source found.")
-
+            
+                documents_list = loader.load()
+        else:
+            raise ValueError("No valid data source found.")
+        
+        return documents_list
+    
     def get_retriever(self, top_k=10):
         return self.vector_store.as_retriever(search_type="mmr", search_kwargs={"k": top_k})
+    
 
-retriever = CSVIngestor().get_retriever()
+class CollectData(BaseModel):
+    funding_ask: str = Field(default="", description="Details regarding the funding request")
+    milestones: str = Field(default="", description="Key milestones for the project")
+    who_we_are: str = Field(default="", description="Introduction to the team or organization")
+    our_story: str = Field(default="", description="Background and motivation for the project")
+    our_solution_milestone: str = Field(default="", description="Details of the solution and project milestones")
+    impact: str = Field(default="", description="Expected impact of the project")
+    member_details: str = Field(default="", description="Details about team members")
+    media: str = Field(default="", description="Relevant media and links")
+    num_fill: int = Field(default=0, description="Number of fields filled in the dictionary")
 
-# ==== Graph State ====
-class GraphState(TypedDict, total=False):
-    rfp: dict
-    is_complete: Optional[bool]
-    retrieved_docs: Optional[List]
-    draft: Optional[str]
-    approved: Optional[bool]
 
-rfp_template = {
-    "rpf_title": None,
-    "pain_point": None,
-    "solution": None,
-    "goals": None,
-    "funding_size": None,
-    "target_users": None,
-    "milestones": None,
-    "background": None,
-    "expected_impact": None,
-    "feature_importances": None,
-    "about_team": None,
-    "media_resources": None
-}
-required_fields = ["rpf_title", "pain_point", "solution", "goals", "funding_size"]
-
-# ==== Helpers ====
-def extract_dict_from_response(text: str) -> dict:
-    try:
-        if "```" in text:
-            text = re.sub(r"```(?:json|python)?", "", text)
-            text = text.replace("```", "").strip()
-        parsed = ast.literal_eval(text)
-        if not isinstance(parsed, dict):
-            raise ValueError("Parsed object is not a dictionary.")
-        clean_dict = {
-            key: (val if str(val).strip().lower() not in ["", "none", "null"] else None)
-            for key, val in parsed.items()
-        }
-        return clean_dict
-    except Exception as e:
-        print("⚠️ Failed to parse dict from LLM output:", e)
-        print("🔍 Raw output:\n", text)
-        return {}
-
-# ==== Node: Collect Input ====
-prompt_template = ChatPromptTemplate.from_messages([
-    ("system", 
-     "You're an assistant helping to write an RFP document.\n"
-     "During the conversation, try to naturally collect the following fields:\n"
-     "- rpf_title\n- pain_point\n- solution\n- goals\n- funding_size\n\n"
-     "Don't ask for everything at once. If some fields are still missing, ask follow-up questions.\n"
-     "Respond conversationally.")
-])
-
-def collect_input(state: GraphState) -> GraphState:
-    print("💬 Let's start a conversation to collect RFP information. (max 5 turns)\n")
-
-    system_messages = prompt_template.format_messages()
-    memory.chat_memory.add_message(system_messages[0])
-
-    for i in range(5):
-        user_input = input(f"[You >] ").strip()
-        if not user_input:
-            print("⚠️ Please type something.")
-            continue
-        memory.chat_memory.add_user_message(user_input)
-        response = llm.invoke(memory.buffer_as_messages)
-        memory.chat_memory.add_ai_message(response.content)
-        print(f"[AI >] {response.content}\n")
-
-    memory.chat_memory.add_user_message(
-        f"Based on our conversation so far, return a Python dictionary with the following keys:\n\n"
-        f"{json.dumps(rfp_template, indent=2)}\n\n"
-        f"Use None for anything that wasn't clearly discussed. Return ONLY the dict."
+def trigger_chain(pydantic_object):
+    parser = JsonOutputParser(pydantic_object=pydantic_object)
+    
+    trigger_prompt = ChatPromptTemplate.from_messages(
+        [
+            ("system", TRIGGER_SYSTEM),
+            ("user", "### Format: {format_instruction}\n\n### Current Json: {current_json}\n\n### Question: {query}")
+        ]
     )
-    response = llm.invoke(memory.buffer_as_messages)
-    rfp_data = extract_dict_from_response(response.content)
-    return {"rfp": rfp_data}
 
-# ==== Node: Check Completion ====
-def check_completion(state: GraphState) -> GraphState:
-    rfp = state.get("rfp", {})
-    is_complete = all(rfp.get(field) is not None for field in required_fields)
-    return {"is_complete": is_complete}
+    updated_prompt = trigger_prompt.partial(format_instruction=parser.get_format_instructions())
 
-# ==== Node: Retrieve Docs ====
-def retrieve_docs(state: GraphState) -> GraphState:
-    query = state.get("rfp", {}).get("rpf_title", "")
-    docs = retriever.invoke(query)
+    chain = updated_prompt | llm | parser
 
-    return {"retrieved_docs": docs}
+    return chain
 
-# ==== Node: Generate Draft ====
-def generate_draft(state: GraphState) -> GraphState:
-    docs_text = "\n".join([doc.page_content for doc in state.get("retrieved_docs", [])])
-    prompt = f"Using the following RFP info and reference documents, write a complete proposal draft.\n\nRFP Info:\n{json.dumps(state.get('rfp', {}), indent=2)}\n\nReference Documents:\n{docs_text}"
-    response = llm.invoke(prompt)
-    return {"draft": response.content}
 
-# ==== Node: User Check ====
-def user_check(state: GraphState) -> GraphState:
-    print("\n===== Draft Generated =====\n")
-    print(state.get("draft", ""))
-    feedback = input("\nAre you satisfied with this draft? (yes/no): ")
-    return {"approved": feedback.strip().lower() == "yes"}
+class Chain():
+    def __init__(self):
+        prompt = ChatPromptTemplate.from_messages(
+            [
+                ("system", SYSTEM_MESSAGE),
+                MessagesPlaceholder(variable_name="history"),
+                ("human", "[Provided Information]\n{information}\n\n[Example RFP]\n{context}\n\n[User Query]\n{query}"),
+            ]
+        )
 
-# ==== Node: Refine Draft ====
-def refine_draft(state: GraphState) -> GraphState:
-    feedback = input("What would you like to change or improve?: ")
-    prompt = f"Please revise the following draft based on the feedback:\n\nDraft:\n{state.get('draft', '')}\n\nFeedback:\n{feedback}"
-    response = llm.invoke(prompt)
-    return {"draft": response.content}
+        self.chain = (
+            {
+                'information': RunnablePassthrough(),
+                'context': RunnablePassthrough(),
+                'query': RunnablePassthrough()
+            }
+            | RunnablePassthrough.assign(history=load_memory)
+            | prompt
+            | llm
+            | StrOutputParser()
+        )
 
-# ==== Build LangGraph ====
-builder = StateGraph(GraphState)
-builder.add_node("collect_input", RunnableLambda(collect_input))
-builder.add_node("check_completion", RunnableLambda(check_completion))
-builder.add_node("retrieve_docs", RunnableLambda(retrieve_docs))
-builder.add_node("generate_draft", RunnableLambda(generate_draft))
-builder.add_node("user_check", RunnableLambda(user_check))
-builder.add_node("refine_draft", RunnableLambda(refine_draft))
+    def run(self, query, information, context):
+        result = self.chain.invoke({"query": query, "information": information, "context": context})
 
-builder.set_entry_point("collect_input")
-builder.add_edge("collect_input", "check_completion")
+        memory.save_context(
+            {"input": query},
+            {"output": result},
+        )
+        return result
 
-builder.add_conditional_edges(
-    "check_completion",
-    lambda state: "yes" if state.get("is_complete") else "no",
-    {"yes": "retrieve_docs", "no": "collect_input"}
-)
 
-builder.add_edge("retrieve_docs", "generate_draft")
-builder.add_edge("generate_draft", "user_check")
+def main():
+    pdf_ingestor = CSVIngestor(data_path='database/RFP')
+    retriever = pdf_ingestor.get_retriever(top_k=5)
+    chain = Chain()
 
-builder.add_conditional_edges(
-    "user_check",
-    lambda state: "yes" if state.get("approved") else "no",
-    {"yes": END, "no": "refine_draft"}
-)
+    trigger = trigger_chain(CollectData)
 
-builder.add_edge("refine_draft", "user_check")
-graph = builder.compile()
+    documents = "The information is insufficient to perform a search."
+    current_json = {
+        "funding_ask": "",
+        "milestones": "",
+        "who_we_are": "",
+        "our_story": "",
+        "our_solution_milestone": "",
+        "impact": "",
+        "member_details": "",
+        "media": "",
+        "num_fill": 0
+    }
 
-# ==== Run ====
-initial_state: GraphState = {
-    "rfp": {},
-    "is_complete": False,
-    "retrieved_docs": [],
-    "draft": "",
-    "approved": False
-}
+    def chat(user_input, *args, **kwargs):
+        nonlocal current_json, documents
+
+        try:
+            if current_json['num_fill'] < 8:
+                current_json = trigger.invoke({'current_json': current_json, 'query': user_input})
+            else:
+                pass
+        except:
+            pass
+
+        logging.info(f"Current JSON before processing: {current_json}")
+
+        if current_json['num_fill'] >= 5:
+            documents = format_docs(retriever.invoke(user_input))
+
+            logging.info(f"Current JSON after processing: {documents}")
+
+        response = chain.run(user_input, current_json, documents)
+        
+        return response
+
+    gr.ChatInterface(
+        fn=chat,
+        textbox=gr.Textbox(placeholder="입력", container=False, scale=7),
+        title="RFP Assistant",
+        description="An assistant for drafting RFPs.",
+        theme="soft",
+        examples = [["What content must be included in an RFP?"], ["How should I write the project timeline and budget?"], ["Please provide the criteria for supplier evaluation."]],
+    ).launch(share=True, server_port=5000)
+
 
 if __name__ == "__main__":
-    final_state = graph.invoke(initial_state)
-    print("\n✅ Final Generated RFP Draft:\n")
-    print(final_state.get("draft", "No draft was generated."))
+    main()
